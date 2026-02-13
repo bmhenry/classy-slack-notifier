@@ -1,0 +1,14 @@
+[Unit]
+Description=Classy Slack Notifier
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m classy_slack_notifier
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=%h/.config/classy-slack-notifier/env
+
+[Install]
+WantedBy=default.target
