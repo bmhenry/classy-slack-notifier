@@ -88,6 +88,13 @@ class SlackMessage:
 class Classification:
     urgency: int          # 1-5 scale
     reason: str           # brief explanation from the LLM
+
+@dataclass
+class FilterResult:
+    action: FilterAction
+    rule: str             # which rule triggered, for logging
+                          # e.g. "self", "bots", "keyword:production down",
+                          # "mentions", "dms", "channel:#random", "default"
 ```
 
 ### 2. Configuration (`config.py`)
@@ -100,28 +107,60 @@ Loads and validates a YAML config file. See the "Configuration" section below fo
 
 ### 3. Pre-Filter (`filters.py`)
 
-A fast, rules-based layer that runs before any LLM call. Takes a `SlackMessage` and the loaded config, returns a `FilterAction`.
+A fast, rules-based layer that runs before any LLM call. Takes a `SlackMessage` and the loaded config, returns a `FilterResult` (action + which rule matched).
 
-**Three-outcome design:**
+**Three possible outcomes:**
 
-| Outcome | Triggers | Action |
+| Outcome | Action |
+|---|---|
+| `SKIP` | Drop silently, no LLM call, no notification |
+| `FORCE_NOTIFY` | Notify immediately, bypass LLM entirely |
+| `CLASSIFY` | Forward to Ollama for urgency scoring |
+
+**Every message category is configurable.** The user chooses which action (`skip`, `classify`, or `force_notify`) applies to each category. There are two kinds of rules:
+
+**Category rules** — apply to a class of messages based on source or context:
+
+| Category | What it matches | Default action |
 |---|---|---|
-| `SKIP` | Bot messages, `never_notify` channels, messages from self | Drop silently, no LLM call |
-| `FORCE_NOTIFY` | `always_notify` channels/users, DMs, direct @mentions, keyword matches | Notify immediately, bypass LLM entirely |
-| `CLASSIFY` | Everything else | Forward to Ollama for urgency scoring |
+| `self` | Messages sent by the authenticated user | `skip` |
+| `bots` | Messages sent by bot users | `skip` |
+| `mentions` | Messages containing a direct @mention of the configured user | `force_notify` |
+| `dms` | Direct messages (1:1 and group DMs) | `force_notify` |
 
-**Evaluation order:**
+**Targeted rules** — apply to specific channels or content patterns:
 
-1. Skip if message is from a bot (configurable — some bots may be important)
-2. Skip if message is from the authenticated user themselves
-3. Skip if channel is in `never_notify` list
-4. Force-notify if channel is in `always_notify` list
-5. Force-notify if message is a DM
-6. Force-notify if message contains a direct @mention of the configured user
-7. Force-notify if message matches any entry in `keywords_override` (case-insensitive substring or regex)
-8. Otherwise, classify via LLM
+| Rule type | What it matches | Default action |
+|---|---|---|
+| `channels` | Messages in a specific named channel | (per-channel, user-defined) |
+| `keywords` | Messages matching a substring or regex pattern | (per-keyword, user-defined) |
 
-The order matters: `never_notify` is checked before `always_notify` so that explicit mutes take precedence. This is a deliberate choice — if a channel is in both lists, the mute wins.
+**Evaluation order (first match wins):**
+
+```
+1. self         →  rules.self action        (default: skip)
+2. bots         →  rules.bots action        (default: skip)
+3. keywords     →  first matching keyword's action
+4. mentions     →  rules.mentions action     (default: force_notify)
+5. dms          →  rules.dms action          (default: force_notify)
+6. channels     →  per-channel action from channels map
+7. (no match)   →  rules.default action      (default: classify)
+```
+
+The order is designed around the principle that **more specific signals win over ambient context**:
+
+- **Self and bots** (steps 1-2) are checked first because these are source-level filters. There's no point evaluating content rules for messages from sources you've explicitly filtered.
+- **Keywords and mentions** (steps 3-4) are content-specific signals that override channel-level rules. If someone says "production down" in a channel you'd normally skip, the keyword should still win — that's an intentional, specific trigger.
+- **DMs** (step 5) come next. A DM is a direct communication to the user, making it more targeted than a channel message, so it takes priority over channel rules.
+- **Channels** (step 6) are the broadest container-level rule.
+- **Default** (step 7) catches everything that didn't match any rule.
+
+**Example: how conflicts resolve.** A bot posts "production down" in #random:
+- Step 1 (self): not from self, continue
+- Step 2 (bots): message is from a bot. If `rules.bots` is `skip` (default), the message is **skipped** — bot filtering wins. If the user has changed `rules.bots` to `classify`, continue to step 3.
+- Step 3 (keywords): "production down" matches a keyword rule set to `force_notify` — message is **force-notified**.
+
+This means a user who wants bot messages to be keyword-scannable can set `bots: classify` (or `bots: force_notify`), and keyword rules will still apply. A user who wants bots silenced entirely keeps the default `bots: skip` and they're filtered before keywords are ever checked.
 
 ### 4. LLM Classifier (`llm_classifier.py`)
 
@@ -249,21 +288,21 @@ def handle_message(event, say):
     if is_duplicate(msg):
         return
 
-    action = pre_filter(msg, config)
+    result = pre_filter(msg, config)
 
-    if action == FilterAction.SKIP:
-        logger.debug(f"Skipped: {msg.channel} / {msg.sender}")
+    if result.action == FilterAction.SKIP:
+        logger.debug(f"Skipped ({result.rule}): {msg.channel} / {msg.sender}")
         return
 
-    if action == FilterAction.FORCE_NOTIFY:
-        notify(msg, reason="Matched force-notify rule")
-        logger.info(f"Force-notified: {msg.channel} / {msg.sender}")
+    if result.action == FilterAction.FORCE_NOTIFY:
+        notify(msg, reason=f"Matched rule: {result.rule}")
+        logger.info(f"Force-notified ({result.rule}): {msg.channel} / {msg.sender}")
         return
 
-    # action == FilterAction.CLASSIFY
+    # result.action == FilterAction.CLASSIFY
     classification = classify(msg)
     logger.info(
-        f"Classified: {msg.channel} / {msg.sender} "
+        f"Classified ({result.rule}): {msg.channel} / {msg.sender} "
         f"-> urgency={classification.urgency} reason={classification.reason}"
     )
 
@@ -278,41 +317,76 @@ def handle_message(event, say):
 **Full schema:**
 
 ```yaml
+# ──────────────────────────────────────────────
 # Ollama settings
-model: "llama3.2:3b"              # Ollama model to use for classification
-ollama_url: "http://localhost:11434"  # Ollama API base URL
-ollama_timeout: 3                 # seconds; if exceeded, fall back to notify
+# ──────────────────────────────────────────────
+model: "llama3.2:3b"                # Ollama model to use for classification
+ollama_url: "http://localhost:11434" # Ollama API base URL
+ollama_timeout: 3                   # seconds; if exceeded, fall back to notify
 
+# ──────────────────────────────────────────────
 # Classification settings
-urgency_threshold: 3              # notify if urgency >= this value (1-5)
-system_prompt: |                  # optional override for the LLM system prompt
+# ──────────────────────────────────────────────
+urgency_threshold: 3                # notify if urgency >= this value (1-5)
+system_prompt: |                    # optional override for the LLM system prompt
   You are a Slack notification triage assistant...
 
-# Channel / user rules
-always_notify:                    # bypass LLM, always send notification
-  - "#incidents"
-  - "#oncall"
-never_notify:                     # always suppress, never send to LLM
-  - "#random"
-  - "#social"
-  - "#standup-bot"
+# ──────────────────────────────────────────────
+# Category rules
+# ──────────────────────────────────────────────
+# Each category maps to an action: skip, classify, or force_notify.
+# These control the pre-filter behavior for broad message categories.
+# Evaluation order is fixed (see "Pre-Filter" in design doc).
+rules:
+  self: skip                        # messages you sent yourself
+  bots: skip                        # messages from bot users
+  mentions: force_notify            # messages where you are @mentioned
+  dms: force_notify                 # direct messages (1:1 and group DMs)
+  default: classify                 # fallback for messages matching no rule
 
-# Keyword overrides — bypass LLM, instant notify on match
-# Matched case-insensitively as substrings. Prefix with "regex:" for regex.
-keywords_override:
-  - "production down"
-  - "pager"
-  - "regex:P[0-1] incident"
+# ──────────────────────────────────────────────
+# Channel rules
+# ──────────────────────────────────────────────
+# Per-channel overrides. Map channel names to actions.
+# Channels not listed here fall through to the default rule.
+channels:
+  "#incidents": force_notify
+  "#oncall": force_notify
+  "#random": skip
+  "#social": skip
+  "#standup-bot": skip
 
-# DM handling
-always_notify_dms: true           # if true, all DMs force-notify (bypass LLM)
+# ──────────────────────────────────────────────
+# Keyword rules
+# ──────────────────────────────────────────────
+# Content-based overrides. Each entry has a pattern and an action.
+# Patterns are matched case-insensitively as substrings by default.
+# Prefix with "regex:" for regex matching.
+# Evaluated in order — first match wins.
+keywords:
+  - pattern: "production down"
+    action: force_notify
+  - pattern: "pager"
+    action: force_notify
+  - pattern: "regex:P[0-1] incident"
+    action: force_notify
+  - pattern: "standup reminder"
+    action: skip
 
-# Bot messages
-skip_bots: true                   # if true, all bot messages are skipped
-
+# ──────────────────────────────────────────────
 # Notification display
-notification_timeout: 10          # seconds before notification auto-dismisses (0 = persistent)
+# ──────────────────────────────────────────────
+notification_timeout: 10            # seconds before auto-dismiss (0 = persistent)
 ```
+
+**Config validation rules:**
+
+- `rules` values must be one of `skip`, `classify`, `force_notify`.
+- `channels` values must follow the same constraint.
+- `keywords` entries must each have `pattern` (string) and `action` (one of the three actions).
+- `urgency_threshold` must be an integer in range 1-5.
+- `ollama_timeout` must be a positive number.
+- Unknown keys are ignored with a logged warning (forward compatibility).
 
 ## Dependency Summary
 
