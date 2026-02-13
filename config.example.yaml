@@ -1,0 +1,69 @@
+# ──────────────────────────────────────────────
+# Ollama settings
+# ──────────────────────────────────────────────
+model: "llama3.2:3b"                # Ollama model to use for classification
+ollama_url: "http://localhost:11434" # Ollama API base URL
+ollama_timeout: 3                   # seconds; if exceeded, fall back to notify
+
+# ──────────────────────────────────────────────
+# Classification settings
+# ──────────────────────────────────────────────
+urgency_threshold: 3                # notify if urgency >= this value (1-5)
+system_prompt: |                    # optional override for the LLM system prompt
+  You are a Slack notification triage assistant. Classify the urgency of the
+  following message on a scale of 1-5:
+
+  1 - Noise: automated messages, routine updates, social chatter
+  2 - Low: informational, no action needed soon
+  3 - Medium: relevant to your work, may need attention within hours
+  4 - High: needs your attention soon, action required
+  5 - Critical: immediate action required, outage, security incident, or direct request for urgent help
+
+  Respond with a JSON object containing "urgency" (integer 1-5) and "reason" (brief explanation).
+
+# ──────────────────────────────────────────────
+# Category rules
+# ──────────────────────────────────────────────
+# Each category maps to an action: skip, classify, or force_notify.
+# These control the pre-filter behavior for broad message categories.
+# Evaluation order is fixed (see "Pre-Filter" in design doc).
+rules:
+  self: skip                        # messages you sent yourself
+  bots: skip                        # messages from bot users
+  mentions: force_notify            # messages where you are @mentioned
+  dms: force_notify                 # direct messages (1:1 and group DMs)
+  default: classify                 # fallback for messages matching no rule
+
+# ──────────────────────────────────────────────
+# Channel rules
+# ──────────────────────────────────────────────
+# Per-channel overrides. Map channel names to actions.
+# Channels not listed here fall through to the default rule.
+channels:
+  "#incidents": force_notify
+  "#oncall": force_notify
+  "#random": skip
+  "#social": skip
+  "#standup-bot": skip
+
+# ──────────────────────────────────────────────
+# Keyword rules
+# ──────────────────────────────────────────────
+# Content-based overrides. Each entry has a pattern and an action.
+# Patterns are matched case-insensitively as substrings by default.
+# Prefix with "regex:" for regex matching.
+# Evaluated in order — first match wins.
+keywords:
+  - pattern: "production down"
+    action: force_notify
+  - pattern: "pager"
+    action: force_notify
+  - pattern: "regex:P[0-1] incident"
+    action: force_notify
+  - pattern: "standup reminder"
+    action: skip
+
+# ──────────────────────────────────────────────
+# Notification display
+# ──────────────────────────────────────────────
+notification_timeout: 10            # seconds before auto-dismiss (0 = persistent)

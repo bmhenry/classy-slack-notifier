@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "classy-slack-notifier"
+version = "0.1.0"
+description = "A smart Slack notification daemon that uses LLM-based classification to filter and prioritize desktop notifications."
+requires-python = ">=3.11"
+dependencies = [
+    "slack-bolt",
+    "slack-sdk",
+    "requests",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-mock",
+]
+
+[project.scripts]
+classy-slack-notifier = "classy_slack_notifier.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
